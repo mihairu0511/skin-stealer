@@ -1,245 +1,332 @@
 #include "PlayMode.hpp"
-
-#include "LitColorTextureProgram.hpp"
-
-#include "DrawLines.hpp"
-#include "Mesh.hpp"
-#include "Load.hpp"
 #include "gl_errors.hpp"
 #include "data_path.hpp"
+#include "gl_compile_program.hpp"
 
-#include <glm/gtc/type_ptr.hpp>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <hb.h>
+#include <hb-ft.h>
+#include "json.hpp"
 
-#include <random>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+using json = nlohmann::json;
 
-GLuint hexapod_meshes_for_lit_color_texture_program = 0;
-Load< MeshBuffer > hexapod_meshes(LoadTagDefault, []() -> MeshBuffer const * {
-	MeshBuffer const *ret = new MeshBuffer(data_path("hexapod.pnct"));
-	hexapod_meshes_for_lit_color_texture_program = ret->make_vao_for_program(lit_color_texture_program->program);
-	return ret;
-});
+//References:
+//https://learnopengl.com/In-Practice/Text-Rendering
+//https://en.wikibooks.org/wiki/OpenGL_Programming/Modern_OpenGL_Tutorial_Text_Rendering_02
+//https://learnopengl.com/Getting-started/Hello-Triangle
+//https://github.com/harfbuzz/harfbuzz-tutorial/blob/master/hello-harfbuzz-freetype.c
+//https://www.freetype.org/freetype2/docs/tutorial/step1.html
+//https://github.com/nlohmann/json
+//https://github.com/lazerwalker/twison
+//https://fonts.google.com/specimen/Quicksand?preview.script=Latn
 
-Load< Scene > hexapod_scene(LoadTagDefault, []() -> Scene const * {
-	return new Scene(data_path("hexapod.scene"), [&](Scene &scene, Scene::Transform *transform, std::string const &mesh_name){
-		Mesh const &mesh = hexapod_meshes->lookup(mesh_name);
-
-		scene.drawables.emplace_back(transform);
-		Scene::Drawable &drawable = scene.drawables.back();
-
-		drawable.pipeline = lit_color_texture_program_pipeline;
-
-		drawable.pipeline.vao = hexapod_meshes_for_lit_color_texture_program;
-		drawable.pipeline.type = mesh.type;
-		drawable.pipeline.start = mesh.start;
-		drawable.pipeline.count = mesh.count;
-
-	});
-});
-
-Load< Sound::Sample > dusty_floor_sample(LoadTagDefault, []() -> Sound::Sample const * {
-	return new Sound::Sample(data_path("dusty-floor.opus"));
-});
-
-
-Load< Sound::Sample > honk_sample(LoadTagDefault, []() -> Sound::Sample const * {
-	return new Sound::Sample(data_path("honk.wav"));
-});
-
-
-PlayMode::PlayMode() : scene(*hexapod_scene) {
-	//get pointers to leg for convenience:
-	for (auto &transform : scene.transforms) {
-		if (transform.name == "Hip.FL") hip = &transform;
-		else if (transform.name == "UpperLeg.FL") upper_leg = &transform;
-		else if (transform.name == "LowerLeg.FL") lower_leg = &transform;
+PlayMode::PlayMode() {
+	//Reference: https://www.freetype.org/freetype2/docs/tutorial/step1.html
+	FT_Library ft;
+	FT_Init_FreeType(&ft);
+	FT_Face face;
+	if (FT_New_Face(ft, data_path("font.ttf").c_str(), 0, &face)) {
+		throw std::runtime_error("Font load failed.");
 	}
-	if (hip == nullptr) throw std::runtime_error("Hip not found.");
-	if (upper_leg == nullptr) throw std::runtime_error("Upper leg not found.");
-	if (lower_leg == nullptr) throw std::runtime_error("Lower leg not found.");
+	FT_Set_Pixel_Sizes(face, 0, 48);
 
-	hip_base_rotation = hip->rotation;
-	upper_leg_base_rotation = upper_leg->rotation;
-	lower_leg_base_rotation = lower_leg->rotation;
+	int pen_x = 0;
+	int max_h = 0;
+	for (char c = 32; c < 127; ++c) {
+		if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+			continue;
+		}
+		pen_x += face->glyph->bitmap.width + 1;
+		max_h = std::max(max_h, int(face->glyph->bitmap.rows));
+	}
+	atlas_w = pen_x;
+	atlas_h = max_h;
 
-	//get pointer to camera for convenience:
-	if (scene.cameras.size() != 1) throw std::runtime_error("Expecting scene to have exactly one camera, but it has " + std::to_string(scene.cameras.size()));
-	camera = &scene.cameras.front();
+    // Reference: https://learnopengl.com/In-Practice/Text-Rendering
+	// https://en.wikibooks.org/wiki/OpenGL_Programming/Modern_OpenGL_Tutorial_Text_Rendering_02
 
-	//start music loop playing:
-	// (note: position will be over-ridden in update())
-	leg_tip_loop = Sound::loop_3D(*dusty_floor_sample, 1.0f, get_leg_tip_position(), 10.0f);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glGenTextures(1, &atlas_tex);
+	glBindTexture(GL_TEXTURE_2D, atlas_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, atlas_w, atlas_h, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	pen_x = 0;
+
+	for (char c = 32; c < 127; ++c) {
+		if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+			continue;
+		}
+		FT_GlyphSlot g = face->glyph;
+		if (g->bitmap.width > 0 && g->bitmap.rows > 0) {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, pen_x, 0, g->bitmap.width, g->bitmap.rows, GL_RED, GL_UNSIGNED_BYTE, g->bitmap.buffer);
+		}
+
+		Glyph gl;
+		gl.u0 = float(pen_x) / atlas_w;
+		gl.v0 = 0.0f;
+		gl.u1 = float(pen_x + g->bitmap.width) / atlas_w;
+		gl.v1 = float(g->bitmap.rows) / atlas_h;
+		gl.w = g->bitmap.width;
+		gl.h = g->bitmap.rows;
+		gl.bearing_x = g->bitmap_left;
+		gl.bearing_y = g->bitmap_top;
+		gl.advance = g->advance.x >> 6;
+		glyphs[c] = gl;
+		pen_x += g->bitmap.width + 1;
+	}
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	ft_face = face;
+	hb_font = hb_ft_font_create(ft_face, nullptr);
+
+	//Reference: https://learnopengl.com/In-Practice/Text-Rendering
+	//https://learnopengl.com/Getting-started/Hello-Triangle
+
+	text_program = gl_compile_program(
+		"#version 330\n"
+		"layout(location=0) in vec2 Position;\n"
+		"layout(location=1) in vec2 TexCoord;\n"
+		"out vec2 texCoord;\n"
+		"void main() { gl_Position = vec4(Position,0.0,1.0); texCoord = TexCoord; }\n"
+		,
+		"#version 330\n"
+		"in vec2 texCoord;\n"
+		"out vec4 fragColor;\n"
+		"uniform sampler2D Tex;\n"
+		"uniform vec3 Color;\n"
+		"void main() { fragColor = vec4(Color, texture(Tex, texCoord).r); }\n"
+	);
+
+	glGenVertexArrays(1, &text_vao);
+	glBindVertexArray(text_vao);
+	glGenBuffers(1, &text_vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 6 * 4, nullptr, GL_DYNAMIC_DRAW);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float)*4, (void*)0);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float)*4, (void*)(sizeof(float)*2));
+	glEnableVertexAttribArray(1);
+	glBindVertexArray(0);
+
+	//Reference: https://github.com/nlohmann/json
+	//https://github.com/lazerwalker/twison
+	std::ifstream f(data_path("story.json"));
+	if (!f) throw std::runtime_error("Could not open story.json");
+	json story;
+	f >> story;
+
+	for (auto const &p : story["passages"]) {
+		Passage passage;
+		passage.name = p["name"];
+
+		std::istringstream iss(p["text"].get<std::string>());
+		std::string line;
+
+		while (std::getline(iss, line)) {
+			if (line.rfind("[[", 0) == 0) {
+				continue;
+			}
+			if (!passage.prose.empty()) {
+				passage.prose += "\n";
+			}
+			passage.prose += line;
+		}
+
+		if (p.contains("links")) {
+			for (auto const &l : p["links"]) {
+				passage.choices.push_back({ l["name"], l["link"] });
+			}
+		}
+		passages[passage.name] = passage;
+	}
+
+	std::string start_pid = story["startnode"];
+	for (auto const &p : story["passages"]) {
+		if (p["pid"] == start_pid) { 
+			current_passage = p["name"]; 
+			break; 
+		}
+	}
+
+	GL_ERRORS();
 }
 
-PlayMode::~PlayMode() {
-}
+PlayMode::~PlayMode() {}
 
 bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size) {
+	(void) window_size;
+	if (evt.type != SDL_EVENT_KEY_DOWN) {
+		return false;
+	}
 
-	if (evt.type == SDL_EVENT_KEY_DOWN) {
-		if (evt.key.key == SDLK_ESCAPE) {
-			SDL_SetWindowRelativeMouseMode(Mode::window, false);
-			return true;
-		} else if (evt.key.key == SDLK_A) {
-			left.downs += 1;
-			left.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_D) {
-			right.downs += 1;
-			right.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_W) {
-			up.downs += 1;
-			up.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_S) {
-			down.downs += 1;
-			down.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_SPACE) {
-			if (honk_oneshot) honk_oneshot->stop();
-			honk_oneshot = Sound::play_3D(*honk_sample, 0.3f, glm::vec3(4.6f, -7.8f, 6.9f)); //hardcoded position of front of car, from blender
+	if (evt.key.key == SDLK_ESCAPE) {
+		return true;
+	}
+
+	if (evt.key.key == SDLK_R) {
+		if (!history.empty()) { 
+			current_passage = history.back();
+			history.pop_back();
 		}
-	} else if (evt.type == SDL_EVENT_KEY_UP) {
-		if (evt.key.key == SDLK_A) {
-			left.pressed = false;
-			return true;
-		} else if (evt.key.key == SDLK_D) {
-			right.pressed = false;
-			return true;
-		} else if (evt.key.key == SDLK_W) {
-			up.pressed = false;
-			return true;
-		} else if (evt.key.key == SDLK_S) {
-			down.pressed = false;
-			return true;
-		}
-	} else if (evt.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-		if (SDL_GetWindowRelativeMouseMode(Mode::window) == false) {
-			SDL_SetWindowRelativeMouseMode(Mode::window, true);
-			return true;
-		}
-	} else if (evt.type == SDL_EVENT_MOUSE_MOTION) {
-		if (SDL_GetWindowRelativeMouseMode(Mode::window) == true) {
-			glm::vec2 motion = glm::vec2(
-				evt.motion.xrel / float(window_size.y),
-				-evt.motion.yrel / float(window_size.y)
-			);
-			camera->transform->rotation = glm::normalize(
-				camera->transform->rotation
-				* glm::angleAxis(-motion.x * camera->fovy, glm::vec3(0.0f, 1.0f, 0.0f))
-				* glm::angleAxis(motion.y * camera->fovy, glm::vec3(1.0f, 0.0f, 0.0f))
-			);
-			return true;
-		}
+
+		return true;
+	}
+
+	int idx = -1;
+	if (evt.key.key == SDLK_1) {
+		idx = 0;
+	} else if (evt.key.key == SDLK_2) {
+		idx = 1;
+	} else if (evt.key.key == SDLK_3) {
+		idx = 2;
+	} else if (evt.key.key == SDLK_4) {
+		idx = 3;
+	}
+
+	auto it = passages.find(current_passage);
+	if (idx >= 0 && it != passages.end() && idx < int(it->second.choices.size())) {
+		goto_passage(it->second.choices[idx].target);
+		return true;
 	}
 
 	return false;
 }
 
-void PlayMode::update(float elapsed) {
+void PlayMode::update(float elapsed) { 
+	(void) elapsed; 
+}
 
-	//slowly rotates through [0,1):
-	wobble += elapsed / 10.0f;
-	wobble -= std::floor(wobble);
+void PlayMode::draw_text(std::string const &text, float x, float y, glm::uvec2 const &drawable_size, glm::vec3 color) {
+	glUseProgram(text_program);
+	glUniform3f(glGetUniformLocation(text_program, "Color"), color.r, color.g, color.b);
+	glUniform1i(glGetUniformLocation(text_program, "Tex"), 0);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, atlas_tex);
+	glBindVertexArray(text_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
 
-	hip->rotation = hip_base_rotation * glm::angleAxis(
-		glm::radians(5.0f * std::sin(wobble * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 1.0f, 0.0f)
-	);
-	upper_leg->rotation = upper_leg_base_rotation * glm::angleAxis(
-		glm::radians(7.0f * std::sin(wobble * 2.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
-	lower_leg->rotation = lower_leg_base_rotation * glm::angleAxis(
-		glm::radians(10.0f * std::sin(wobble * 3.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
+	//Reference: https://github.com/harfbuzz/harfbuzz-tutorial/blob/master/hello-harfbuzz-freetype.c
+	hb_buffer_t *buf = hb_buffer_create();
+	hb_buffer_add_utf8(buf, text.c_str(), -1, 0, -1);
+	hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
+	hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
+	hb_buffer_set_language(buf, hb_language_from_string("en", -1));
+	hb_shape(hb_font, buf, nullptr, 0);
 
-	//move sound to follow leg tip position:
-	leg_tip_loop->set_position(get_leg_tip_position(), 1.0f / 60.0f);
+	unsigned int count = hb_buffer_get_length(buf);
+	hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, nullptr);
+	hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, nullptr);
 
-	//move camera:
-	{
+	float pen_x = x;
+	for (unsigned int i = 0; i < count; ++i) {
+		char c = text[info[i].cluster];
+		auto it = glyphs.find(c);
+		if (it != glyphs.end()) {
+			Glyph const &g = it->second;
+			float gx = pen_x + g.bearing_x + pos[i].x_offset / 64.0f;
+			float gy = y - g.bearing_y;
+			float gw = float(g.w), gh = float(g.h);
 
-		//combine inputs into a move:
-		constexpr float PlayerSpeed = 30.0f;
-		glm::vec2 move = glm::vec2(0.0f);
-		if (left.pressed && !right.pressed) move.x =-1.0f;
-		if (!left.pressed && right.pressed) move.x = 1.0f;
-		if (down.pressed && !up.pressed) move.y =-1.0f;
-		if (!down.pressed && up.pressed) move.y = 1.0f;
+			auto cx = [&](float px) { 
+				return px / drawable_size.x * 2.0f - 1.0f; 
+			};
+			auto cy = [&](float py){
+				return 1.0f - py / drawable_size.y * 2.0f;
+			};
 
-		//make it so that moving diagonally doesn't go faster:
-		if (move != glm::vec2(0.0f)) move = glm::normalize(move) * PlayerSpeed * elapsed;
+			float x0 = cx(gx);
+			float x1 = cx(gx + gw);
+			float y0 = cy(gy);
+			float y1 = cy(gy + gh);
 
-		glm::mat4x3 frame = camera->transform->make_parent_from_local();
-		glm::vec3 frame_right = frame[0];
-		//glm::vec3 up = frame[1];
-		glm::vec3 frame_forward = -frame[2];
-
-		camera->transform->position += move.x * frame_right + move.y * frame_forward;
+			float verts[6*4] = {x0, y0, g.u0, g.v0,  x0, y1, g.u0, g.v1,  x1, y1, g.u1, g.v1, x0, y0, g.u0, g.v0,  x1, y1, g.u1, g.v1,  x1, y0, g.u1, g.v0,};
+			glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+			glDrawArrays(GL_TRIANGLES, 0, 6);
+		}
+		pen_x += pos[i].x_advance / 64.0f;
 	}
 
-	{ //update listener to camera position:
-		glm::mat4x3 frame = camera->transform->make_parent_from_local();
-		glm::vec3 frame_right = frame[0];
-		glm::vec3 frame_at = frame[3];
-		Sound::listener.set_position_right(frame_at, frame_right, 1.0f / 60.0f);
-	}
+	hb_buffer_destroy(buf);
+	glBindVertexArray(0);
+	glUseProgram(0);
+}
 
-	//reset button press counters:
-	left.downs = 0;
-	right.downs = 0;
-	up.downs = 0;
-	down.downs = 0;
+float PlayMode::measure_text(std::string const &text) {
+	float w = 0.0f;
+	for (char c : text) {
+		auto it = glyphs.find(c);
+		if (it != glyphs.end()) {
+			w += it->second.advance;
+		}
+	}
+	return w;
+}
+
+std::vector<std::string> PlayMode::wrap_text(std::string const &text, float max_width) {
+	std::vector<std::string> lines;
+	std::istringstream iss(text);
+	std::string word, line;
+	while (iss >> word) {
+		std::string test = line.empty() ? word : line + " " + word;
+		if (measure_text(test) > max_width && !line.empty()) {
+			lines.push_back(line);
+			line = word;
+		} else {
+			line = test;
+		}
+	}
+	if (!line.empty()) {
+		lines.push_back(line);
+	}
+	return lines;
+}
+
+void PlayMode::draw_text_centered(std::string const &text, float y, glm::uvec2 const &drawable_size, glm::vec3 color) {
+	draw_text(text, (drawable_size.x - measure_text(text)) * 0.5f, y, drawable_size, color);
+}
+
+void PlayMode::goto_passage(std::string const &name) {
+	if (passages.count(name)) {
+		history.push_back(current_passage);
+		current_passage = name;
+	}
 }
 
 void PlayMode::draw(glm::uvec2 const &drawable_size) {
-	//update camera aspect ratio for drawable:
-	camera->aspect = float(drawable_size.x) / float(drawable_size.y);
-
-	//set up light type and position for lit_color_texture_program:
-	// TODO: consider using the Light(s) in the scene to do this
-	glUseProgram(lit_color_texture_program->program);
-	glUniform1i(lit_color_texture_program->LIGHT_TYPE_int, 1);
-	glUniform3fv(lit_color_texture_program->LIGHT_DIRECTION_vec3, 1, glm::value_ptr(glm::vec3(0.0f, 0.0f,-1.0f)));
-	glUniform3fv(lit_color_texture_program->LIGHT_ENERGY_vec3, 1, glm::value_ptr(glm::vec3(1.0f, 1.0f, 0.95f)));
-	glUseProgram(0);
-
-	glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
-	glClearDepth(1.0f); //1.0 is actually the default value to clear the depth buffer to, but FYI you can change it.
+	glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	glDisable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-	glEnable(GL_DEPTH_TEST);
-	glDepthFunc(GL_LESS); //this is the default depth comparison function, but FYI you can change it.
+	auto it = passages.find(current_passage);
+	if (it != passages.end()) {
+		Passage const &p = it->second;
+		float y = drawable_size.y * 0.3f;
 
-	scene.draw(*camera);
-
-	{ //use DrawLines to overlay some text:
-		glDisable(GL_DEPTH_TEST);
-		float aspect = float(drawable_size.x) / float(drawable_size.y);
-		DrawLines lines(glm::mat4(
-			1.0f / aspect, 0.0f, 0.0f, 0.0f,
-			0.0f, 1.0f, 0.0f, 0.0f,
-			0.0f, 0.0f, 1.0f, 0.0f,
-			0.0f, 0.0f, 0.0f, 1.0f
-		));
-
-		constexpr float H = 0.09f;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H, -1.0 + 0.1f * H, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0x00, 0x00, 0x00, 0x00));
-		float ofs = 2.0f / drawable_size.y;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H + ofs, -1.0 + + 0.1f * H + ofs, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
+		for (std::string const &line : wrap_text(p.prose, drawable_size.x * 0.5f)) {
+			draw_text_centered(line, y, drawable_size, glm::vec3(1.0f));
+			y += 60.0f;
+		}
+		y += 60.0f;
+		for (size_t i = 0; i < p.choices.size(); ++i) {
+			draw_text_centered(std::to_string(i+1) + ") " + p.choices[i].label, y, drawable_size, glm::vec3(0.8f, 0.9f, 1.0f));
+			y += 50.0f;
+		}
 	}
-	GL_ERRORS();
-}
 
-glm::vec3 PlayMode::get_leg_tip_position() {
-	//the vertex position here was read from the model in blender:
-	return lower_leg->make_world_from_local() * glm::vec4(-1.26137f, -11.861f, 0.0f, 1.0f);
+	if (!history.empty()) {
+		draw_text_centered("(R) go back", drawable_size.y - 60.0f, drawable_size, glm::vec3(0.5f));
+	}
+
+	glDisable(GL_BLEND);
+	GL_ERRORS();
 }

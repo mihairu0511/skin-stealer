@@ -1,51 +1,63 @@
 #include "Mode.hpp"
-
-#include "Scene.hpp"
-#include "Sound.hpp"
-
+#include "GL.hpp"
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <hb.h>
 #include <glm/glm.hpp>
-
+#include <map>
+#include <string>
 #include <vector>
-#include <deque>
 
 struct PlayMode : Mode {
 	PlayMode();
 	virtual ~PlayMode();
 
-	//functions called by main loop:
 	virtual bool handle_event(SDL_Event const &, glm::uvec2 const &window_size) override;
 	virtual void update(float elapsed) override;
 	virtual void draw(glm::uvec2 const &drawable_size) override;
+	void draw_text(std::string const &text, float x, float y, glm::uvec2 const &drawable_size, glm::vec3 color);
 
-	//----- game state -----
 
-	//input tracking:
-	struct Button {
-		uint8_t downs = 0;
-		uint8_t pressed = 0;
-	} left, right, down, up;
+	struct Glyph {
+		float u0, v0, u1, v1;
+		int w, h;
+		int bearing_x, bearing_y;
+		int advance;
+	};
 
-	//local copy of the game scene (so code can change it during gameplay):
-	Scene scene;
+	std::map<char, Glyph> glyphs;
+	GLuint atlas_tex = 0;
+	int atlas_w = 0;
+	int atlas_h = 0;
 
-	//hexapod leg to wobble:
-	Scene::Transform *hip = nullptr;
-	Scene::Transform *upper_leg = nullptr;
-	Scene::Transform *lower_leg = nullptr;
-	glm::quat hip_base_rotation;
-	glm::quat upper_leg_base_rotation;
-	glm::quat lower_leg_base_rotation;
-	float wobble = 0.0f;
+	GLuint glyph_tex = 0;
+	int glyph_w = 0;
+	int glyph_h = 0;
+	GLuint text_program = 0;
+	GLuint text_vao = 0;
+	GLuint text_vbo = 0;
 
-	glm::vec3 get_leg_tip_position();
+	FT_Face ft_face = nullptr;
+	hb_font_t *hb_font = nullptr;
 
-	//music coming from the tip of the leg (as a demonstration):
-	std::shared_ptr< Sound::PlayingSample > leg_tip_loop;
+	struct Choice {
+		std::string label;
+		std::string target;
+	};
 
-	//car honk sound:
-	std::shared_ptr< Sound::PlayingSample > honk_oneshot;
-	
-	//camera:
-	Scene::Camera *camera = nullptr;
+	struct Passage {
+		std::string name;
+		std::string prose;
+		std::vector<Choice> choices;
+	};
 
+	std::map<std::string, Passage> passages;
+	std::string current_passage;
+	std::vector<std::string> history;
+
+	void goto_passage(std::string const &name);
+	float measure_text(std::string const &text);
+	std::vector<std::string> wrap_text(std::string const &text, float max_width);
+
+	void draw_text_centered(std::string const &text, float y, glm::uvec2 const &drawable_size, glm::vec3 color);
 };
